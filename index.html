@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <title>S3 署名付きURLダウンロード構成まとめ</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.6;
+      margin: 20px;
+      max-width: 960px;
+    }
+    h1, h2, h3 {
+      margin-top: 1.4em;
+    }
+    pre {
+      background: #f4f4f4;
+      padding: 10px 12px;
+      overflow-x: auto;
+      border-radius: 4px;
+      font-size: 13px;
+    }
+    code {
+      font-family: Menlo, Monaco, Consolas, "Courier New", monospace;
+    }
+    .diagram {
+      background: #fafafa;
+      padding: 12px;
+      border-radius: 4px;
+      border: 1px solid #ddd;
+    }
+    .note {
+      border-left: 4px solid #007acc;
+      padding-left: 10px;
+      margin: 12px 0;
+      background: #f0f8ff;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      margin: 10px 0;
+    }
+    th, td {
+      border: 1px solid #ddd;
+      padding: 4px 8px;
+      font-size: 13px;
+    }
+    th {
+      background: #f7f7f7;
+    }
+  </style>
+</head>
+<body>
+  <h1>S3 署名付きURLを使ったダウンロード構成まとめ</h1>
+
+  <p>
+    「検索チャットボット → フロント → Lambda → S3」という構成で、
+    <strong>署名付きURL（Pre-signed URL）</strong> を使って安全にファイルをダウンロードする仕組みの
+    <strong>図示 / 説明 / フロントJSサンプル / Lambdaサンプル / 必要IAM権限</strong> を1枚のHTMLにまとめたものです。
+  </p>
+
+  <hr />
+
+  <h2>1. 全体アーキテクチャ（図示）</h2>
+
+  <div class="diagram">
+    <pre>
+[ユーザーのブラウザ]
+   └─(1) 検索結果を表示（ファイル名 + ダウンロードボタン）
+        └─(2) ダウンロードボタン押下
+             ↓  HTTP(S) リクエスト（s3Key付き）
+[API Gateway]
+   └─(3) /download エンドポイントで Lambda を起動
+        ↓
+[Lambda (署名付きURL発行)]
+   └─(4) BUCKET_NAME + s3Key から S3 用 署名付きURLを生成
+        └─(5) { "downloadUrl": "https://...署名付きURL..." } をレスポンス
+             ↓
+[ユーザーのブラウザ]
+   └─(6) downloadUrl に window.location で遷移
+        ↓
+[Amazon S3 バケット]
+   └─(7) 署名付きURLの検証（署名・有効期限）
+        └─(8) ファイルデータを直接ブラウザに返す
+    </pre>
+  </div>
+
+  <div class="note">
+    <strong>ポイント:</strong> Lambda がファイル本体を中継せず、<br />
+    &raquo; <strong>Lambda = 署名付きURL発行マン</strong><br />
+    &raquo; <strong>S3 = 実ファイル配信係</strong><br />
+    という役割分担にすることで、容量・パフォーマンス・制限面がかなり楽になります。
+  </div>
+
+  <h2>2. 処理の流れ（もう少し詳しく）</h2>
+
+  <ol>
+    <li>チャットボットの検索結果に、各ファイルの <code>s3Key</code>（例: <code>docs/manuals/001.pdf</code>） を埋め込んだ「ダウンロード」ボタンを表示する。</li>
+    <li>ユーザーが「ダウンロード」を押すと、フロントJSが <code>/download?s3Key=docs/manuals/001.pdf</code> のようなAPIを叩く。</li>
+    <li>API Gateway が Lambda 関数を起動。</li>
+    <li>Lambda は受け取った <code>s3Key</code> と環境変数 <code>BUCKET_NAME</code> を使って、S3クライアントで <strong>署名付きURL</strong> を生成する。</li>
+    <li>Lambda は JSON で <code>{ "downloadUrl": "https://..." }</code> を返す。</li>
+    <li>フロントJSは <code>window.location.href = downloadUrl;</code> でそのURLへ遷移させる。</li>
+    <li>ブラウザは S3 に直接アクセスし、URLに含まれる署名・有効期限が正しければファイルをダウンロードできる。</li>
+  </ol>
+
+  <hr />
+
+  <h2>3. フロント側 HTML+JavaScript サンプル</h2>
+
+  <p>最低限のイメージです。実際にはCSSやフレームワークに合わせて調整してください。</p>
+
+  <pre><code>&lt;!DOCTYPE html&gt;
+&lt;html lang="ja"&gt;
+&lt;head&gt;
+  &lt;meta charset="UTF-8" /&gt;
+  &lt;title&gt;ファイル検索結果サンプル&lt;/title&gt;
+&lt;/head&gt;
+&lt;body&gt;
+  &lt;h1&gt;検索結果（サンプル）&lt;/h1&gt;
+
+  &lt;table&gt;
+    &lt;thead&gt;
+      &lt;tr&gt;
+        &lt;th&gt;ファイル名&lt;/th&gt;
+        &lt;th&gt;説明&lt;/th&gt;
+        &lt;th&gt;操作&lt;/th&gt;
+      &lt;/tr&gt;
+    &lt;/thead&gt;
+    &lt;tbody&gt;
+      &lt;tr&gt;
+        &lt;td&gt;システム仕様書 v1.0&lt;/td&gt;
+        &lt;td&gt;顧客管理システムの仕様書&lt;/td&gt;
+        &lt;td&gt;
+          &lt;button onclick="downloadFile('docs/specs/customer-system-v1.pdf')"&gt;
+            ダウンロード
+          &lt;/button&gt;
+        &lt;/td&gt;
+      &lt;/tr&gt;
+      &lt;tr&gt;
+        &lt;td&gt;運用マニュアル&lt;/td&gt;
+        &lt;td&gt;運用担当者向けマニュアル&lt;/td&gt;
+        &lt;td&gt;
+          &lt;button onclick="downloadFile('docs/manuals/operations-manual.pdf')"&gt;
+            ダウンロード
+          &lt;/button&gt;
+        &lt;/td&gt;
+      &lt;/tr&gt;
+    &lt;/tbody&gt;
+  &lt;/table&gt;
+
+  &lt;script&gt;
+    // API Gateway の URL（ステージ込み）を自分の環境に合わせて変更
+    const DOWNLOAD_API_BASE =
+      "https://your-api-id.execute-api.ap-northeast-1.amazonaws.com/prod";
+
+    async function downloadFile(s3Key) {
+      try {
+        const url =
+          DOWNLOAD_API_BASE +
+          "/download?s3Key=" +
+          encodeURIComponent(s3Key);
+
+        const res = await fetch(url, {
+          method: "GET",
+        });
+
+        if (!res.ok) {
+          const text = await res.text();
+          alert("ダウンロードURLの取得に失敗しました: " + text);
+          return;
+        }
+
+        const data = await res.json();
+        if (!data.downloadUrl) {
+          alert("レスポンスに downloadUrl が含まれていません。");
+          return;
+        }
+
+        // ここでブラウザを署名付きURLへ遷移させる
+        window.location.href = data.downloadUrl;
+      } catch (e) {
+        console.error(e);
+        alert("エラーが発生しました: " + e);
+      }
+    }
+  &lt;/script&gt;
+&lt;/body&gt;
+&lt;/html&gt;
+</code></pre>
+
+  <div class="note">
+    <strong>ポイント:</strong><br />
+    - フロントは S3 に直接アクセスせず、まず Lambda 経由で「一時URL」をもらう。<br />
+    - その後、ブラウザを一時URLへ飛ばすだけなのでシンプル。
+  </div>
+
+  <hr />
+
+  <h2>4. Lambda 関数サンプル（Node.js）</h2>
+
+  <p>Node.js 20.x で動かす想定です。AWS SDK v2 を利用したシンプルな例です。</p>
+
+  <pre><code>'use strict';
+
+const AWS = require('aws-sdk');
+const s3 = new AWS.S3();
+
+// 環境変数に BUCKET_NAME を設定しておく
+const BUCKET_NAME = process.env.BUCKET_NAME;
+
+// CORS を許可したい場合のヘッダ例
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "*"
+};
+
+exports.handler = async (event) =&gt; {
+  console.log("Event:", JSON.stringify(event));
+
+  const qs = event.queryStringParameters || {};
+  const s3Key = qs.s3Key;
+
+  if (!s3Key) {
+    return {
+      statusCode: 400,
+      headers: {
+        ...CORS_HEADERS,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        message: "query parameter 's3Key' is required"
+      })
+    };
+  }
+
+  try {
+    // 署名付きURLを生成
+    const url = await s3.getSignedUrlPromise("getObject", {
+      Bucket: BUCKET_NAME,
+      Key: s3Key,
+      Expires: 60 * 5 // 5分有効
+    });
+
+    return {
+      statusCode: 200,
+      headers: {
+        ...CORS_HEADERS,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        downloadUrl: url
+      })
+    };
+
+  } catch (err) {
+    console.error("Error generating presigned URL:", err);
+
+    return {
+      statusCode: 500,
+      headers: {
+        ...CORS_HEADERS,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        message: "Failed to generate presigned URL",
+        error: String(err)
+      })
+    };
+  }
+};
+</code></pre>
+
+  <div class="note">
+    <strong>ポイント:</strong><br />
+    - <code>BUCKET_NAME</code> は環境変数に設定（コンソール or IaC）。<br />
+    - <code>Expires</code> で有効期限を秒指定（ここでは 300 秒 = 5 分）。<br />
+    - CORS を有効化しておくとブラウザから直接呼び出しやすい。
+  </div>
+
+  <hr />
+
+  <h2>5. 必要な IAM 権限（Lambda 実行ロール用）</h2>
+
+  <p>
+    Lambda が署名付きURLを発行するには、<strong>実際にS3オブジェクトへのアクセス権があること</strong>が前提です。
+    そのため Lambda の実行ロールには少なくとも <code>s3:GetObject</code> が必要です。
+  </p>
+
+  <h3>5.1 Lambda 実行ロールにアタッチするポリシー例</h3>
+
+  <p>特定バケット配下（例: <code>your-bucket-name/docs/</code> 以下）に限定した例です。</p>
+
+  <pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowLambdaToGetObjectsForPresignedUrl",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject"
+      ],
+      "Resource": "arn:aws:s3:::your-bucket-name/docs/*"
+    }
+  ]
+}
+</code></pre>
+
+  <p>バケット全体を対象にする場合は、リソースを <code>"arn:aws:s3:::your-bucket-name/*"</code> とします。</p>
+
+  <h3>5.2 併せて必要になることが多い権限</h3>
+
+  <ul>
+    <li><strong>AWS 管理ポリシー</strong> <code>AWSLambdaBasicExecutionRole</code><br />
+      &raquo; CloudWatch Logs へのログ出力のために付けるのが一般的です。
+    </li>
+    <li>API Gateway から Lambda を呼び出すための <strong>リソースポリシー or コンソール設定</strong><br />
+      &raquo; コンソールで API Gateway &gt; 統合リクエスト を設定すると自動で付くことが多いです。
+    </li>
+  </ul>
+
+  <hr />
+
+  <h2>6. まとめ</h2>
+
+  <ul>
+    <li>チャットボットは検索結果として <code>s3Key</code> を返す。</li>
+    <li>フロントは「ダウンロード」ボタンから Lambda(API Gateway) を叩く。</li>
+    <li>Lambda は S3 の署名付きURLを生成して JSON で返す。</li>
+    <li>フロントは <code>downloadUrl</code> に遷移させるだけで S3 から直接ダウンロードできる。</li>
+    <li>Lambda 実行ロールには <code>s3:GetObject</code> 権限を付与しておく。</li>
+  </ul>
+
+  <p>
+    これをベースに、<br />
+    - プレビュー用URL（PDFビューアなど）<br />
+    - 有効期限やパスの制御<br />
+    - CloudFront + 署名付きURL への発展<br />
+    などをやっていくと、かなり気持ちよく拡張できます。
+  </p>
+</body>
+</html>
